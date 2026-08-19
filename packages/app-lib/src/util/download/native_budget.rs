@@ -1,10 +1,11 @@
 //! Per-authority connection budget for the native download engine.
 
-use crate::util::fetch::{DownloadRoute, ProxyPolicy};
+use crate::util::fetch::{DownloadRoute, FetchSemaphore, ProxyPolicy};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
+use tokio::sync::SemaphorePermit;
 
 const MAX_NATIVE_CONNECTIONS: usize = 32;
 const MAX_CONNECTIONS_PER_AUTHORITY: usize = 8;
@@ -24,6 +25,55 @@ static GLOBAL_BUDGET: LazyLock<Arc<Semaphore>> =
 pub(crate) struct NativeBudgetPermit {
     _global: OwnedSemaphorePermit,
     _authority: Option<OwnedSemaphorePermit>,
+}
+
+pub(crate) struct NativeConnectionPermit<'a> {
+	_fetch: SemaphorePermit<'a>,
+	_native: NativeBudgetPermit,
+}
+
+pub(crate) async fn acquire_connection<'a>(
+	route: &DownloadRoute,
+	semaphore: &'a FetchSemaphore,
+) -> crate::Result<NativeConnectionPermit<'a>> {
+	let native = acquire(route).await?;
+	let fetch = semaphore.0.acquire().await?;
+	Ok(NativeConnectionPermit {
+		_fetch: fetch,
+		_native: native,
+	})
+}
+
+pub(crate) fn try_acquire_connection<'a>(
+	route: &DownloadRoute,
+	semaphore: &'a FetchSemaphore,
+) -> Option<NativeConnectionPermit<'a>> {
+	let native = try_acquire(route).ok()?;
+	let fetch = semaphore.0.try_acquire().ok()?;
+	Some(NativeConnectionPermit {
+		_fetch: fetch,
+		_native: native,
+	})
+}
+
+pub(crate) async fn acquire_connections<'a>(
+	route: &DownloadRoute,
+	semaphore: &'a FetchSemaphore,
+	count: usize,
+) -> crate::Result<Vec<NativeConnectionPermit<'a>>> {
+	let native_permits = acquire_many(route, count).await?;
+	let mut fetch = semaphore.0.acquire_many(count as u32).await?;
+	let mut permits = Vec::with_capacity(count);
+	for native in native_permits {
+		let fetch = fetch
+			.split(1)
+			.expect("fetch permit batch has enough permits");
+		permits.push(NativeConnectionPermit {
+			_fetch: fetch,
+			_native: native,
+		});
+	}
+	Ok(permits)
 }
 
 fn budget(route: &DownloadRoute) -> Option<Arc<Semaphore>> {

@@ -27,7 +27,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::{self, Instant};
-use tokio::sync::{Mutex as AsyncMutex, Notify, Semaphore, SemaphorePermit};
+use tokio::sync::{Mutex as AsyncMutex, Notify, Semaphore};
 use tokio::{
     fs::File,
     io::{AsyncReadExt, AsyncWriteExt},
@@ -2785,22 +2785,12 @@ async fn acquire_initial_segment_permits<'a>(
     route: &DownloadRoute,
     semaphore: &'a FetchSemaphore,
     count: usize,
-) -> crate::Result<Vec<NativeConnectionPermit<'a>>> {
+) -> crate::Result<Vec<crate::util::download::native_budget::NativeConnectionPermit<'a>>> {
     let queue_started = Instant::now();
-    let native_permits =
-        crate::util::download::native_budget::acquire_many(route, count)
-            .await?;
-    let mut global = semaphore.0.acquire_many(count as u32).await?;
-    let mut permits = Vec::with_capacity(count);
-    for native in native_permits {
-        let global = global
-            .split(1)
-            .expect("fetch permit batch has enough permits");
-        permits.push(NativeConnectionPermit {
-            _global: global,
-            _native: native,
-        });
-    }
+    let permits = crate::util::download::native_budget::acquire_connections(
+        route, semaphore, count,
+    )
+    .await?;
     tracing::debug!(
         queue_wait_ms = queue_started.elapsed().as_millis(),
         actual_segments = permits.len(),
@@ -2809,34 +2799,21 @@ async fn acquire_initial_segment_permits<'a>(
     Ok(permits)
 }
 
-struct NativeConnectionPermit<'a> {
-    _global: SemaphorePermit<'a>,
-    _native: crate::util::download::native_budget::NativeBudgetPermit,
-}
-
 async fn acquire_native_connection<'a>(
     route: &DownloadRoute,
     semaphore: &'a FetchSemaphore,
-) -> crate::Result<NativeConnectionPermit<'a>> {
-    let native = crate::util::download::native_budget::acquire(route).await?;
-    let global = semaphore.0.acquire().await?;
-    Ok(NativeConnectionPermit {
-        _global: global,
-        _native: native,
-    })
+) -> crate::Result<crate::util::download::native_budget::NativeConnectionPermit<'a>> {
+    crate::util::download::native_budget::acquire_connection(route, semaphore)
+        .await
 }
 
 fn try_acquire_native_connection<'a>(
     route: &DownloadRoute,
     semaphore: &'a FetchSemaphore,
-) -> Option<NativeConnectionPermit<'a>> {
-    let native =
-        crate::util::download::native_budget::try_acquire(route).ok()?;
-    let global = semaphore.0.try_acquire().ok()?;
-    Some(NativeConnectionPermit {
-        _global: global,
-        _native: native,
-    })
+) -> Option<crate::util::download::native_budget::NativeConnectionPermit<'a>> {
+    crate::util::download::native_budget::try_acquire_connection(
+        route, semaphore,
+    )
 }
 
 fn allow_low_throughput_route_switch(
@@ -3428,7 +3405,7 @@ async fn download_segment(
     credentials: Option<&crate::state::ModrinthCredentials>,
     download_meta: Option<&DownloadMeta>,
     part_path: &Path,
-    _permit: NativeConnectionPermit<'_>,
+    _permit: crate::util::download::native_budget::NativeConnectionPermit<'_>,
     system_client: &reqwest::Client,
     direct_client: &reqwest::Client,
     progress: tokio::sync::mpsc::UnboundedSender<u64>,
