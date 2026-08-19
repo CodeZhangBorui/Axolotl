@@ -49,6 +49,14 @@ pub(crate) use super::download::partial::{
 	open_download_file_for_append, part_resume_expected,
 	preserve_or_remove_partial, remove_if_exists, suffixed_path,
 };
+pub(crate) use super::download::range::{
+	cleanup_segment_files, segment_path,
+	tail_candidate_path, validate_resource_version, DownloadRange,
+	DownloadRangeGuard, ResourceValidator,
+	SegmentCleanupGuard, SegmentDownloadCompletion, SegmentDownloadError,
+	SegmentedDownloadSuccess, TailCandidateCleanupGuard,
+	TailCandidateCompletion,
+};
 
 pub const DOWNLOAD_META_HEADER: &str = "modrinth-download-meta";
 
@@ -2860,106 +2868,6 @@ async fn send_path_request(
     .await
 }
 
-#[derive(Clone)]
-struct DownloadRange {
-    index: usize,
-    start: u64,
-    state: Arc<Mutex<DownloadRangeState>>,
-}
-
-struct DownloadRangeState {
-    end: u64,
-    downloaded: u64,
-    active: bool,
-}
-
-impl DownloadRange {
-    fn new(index: usize, start: u64, end: u64) -> Self {
-        Self {
-            index,
-            start,
-            state: Arc::new(Mutex::new(DownloadRangeState {
-                end,
-                downloaded: 0,
-                active: true,
-            })),
-        }
-    }
-
-    fn end(&self) -> u64 {
-        self.state.lock().end
-    }
-
-    fn remaining(&self) -> u64 {
-        let state = self.state.lock();
-        state
-            .end
-            .saturating_add(1)
-            .saturating_sub(self.start.saturating_add(state.downloaded))
-    }
-
-    fn is_active(&self) -> bool {
-        self.state.lock().active
-    }
-
-    fn split_tail(&self, index: usize) -> Option<Self> {
-        let mut state = self.state.lock();
-        let remaining = state
-            .end
-            .saturating_add(1)
-            .saturating_sub(self.start.saturating_add(state.downloaded));
-        if remaining < 256 * 1024 {
-            return None;
-        }
-        let split_size = remaining.saturating_mul(40) / 100;
-        let split_start =
-            state.end.saturating_add(1).saturating_sub(split_size);
-        if split_start <= self.start.saturating_add(state.downloaded) {
-            return None;
-        }
-        let split_end = state.end;
-        state.end = split_start - 1;
-        drop(state);
-        Some(Self::new(index, split_start, split_end))
-    }
-
-    fn accept_chunk(&self, chunk_size: usize) -> (usize, bool) {
-        let mut state = self.state.lock();
-        let remaining = state
-            .end
-            .saturating_add(1)
-            .saturating_sub(self.start.saturating_add(state.downloaded));
-        let accepted = usize::try_from(remaining)
-            .unwrap_or(usize::MAX)
-            .min(chunk_size);
-        state.downloaded += accepted as u64;
-        (accepted, state.downloaded == state.end - self.start + 1)
-    }
-
-    fn finish(&self) -> bool {
-        let mut state = self.state.lock();
-        state.active = false;
-        state.downloaded == state.end - self.start + 1
-    }
-}
-
-struct DownloadRangeGuard(Arc<Mutex<DownloadRangeState>>);
-
-impl Drop for DownloadRangeGuard {
-    fn drop(&mut self) {
-        self.0.lock().active = false;
-    }
-}
-
-struct SegmentedDownloadSuccess {
-    size: u64,
-    final_url: String,
-    ttfb: time::Duration,
-    transfer_elapsed: time::Duration,
-    remote_addr: Option<std::net::SocketAddr>,
-    http_version: Option<reqwest::Version>,
-}
-
 enum SegmentedDownloadOutcome {
     Success(SegmentedDownloadSuccess),
     FallbackSingle {
@@ -2972,12 +2880,6 @@ enum SegmentedDownloadOutcome {
     Fatal(crate::Error),
 }
 
-enum SegmentDownloadError {
-    Protocol(&'static str),
-    Transport,
-    Fatal(crate::Error),
-}
-
 #[derive(Clone, Debug)]
 struct RouteProbeResult {
     route: DownloadRoute,
@@ -2987,103 +2889,6 @@ struct RouteProbeResult {
 
 type RouteProbeFuture<'a> =
     Pin<Box<dyn Future<Output = Option<RouteProbeResult>> + Send + 'a>>;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ResourceValidator {
-    etag: Option<String>,
-    last_modified: Option<String>,
-}
-
-struct SegmentDownloadCompletion {
-    final_url: String,
-    is_first_range: bool,
-    ttfb: time::Duration,
-    remote_addr: Option<std::net::SocketAddr>,
-    http_version: Option<reqwest::Version>,
-}
-
-struct SegmentCleanupGuard {
-    part_path: PathBuf,
-    armed: bool,
-    part_dirty: bool,
-}
-
-impl SegmentCleanupGuard {
-    fn new(part_path: &Path) -> Self {
-        Self {
-            part_path: part_path.to_path_buf(),
-            armed: true,
-            part_dirty: false,
-        }
-    }
-
-    /// Marks the `.part` file as written to by the segment merge, so cleanup
-    /// removes it. Before the merge, segments only write their own sibling
-    /// files, and the `.part` file may hold preserved resume data that must
-    /// survive a failed or abandoned segmented attempt.
-    fn mark_part_dirty(&mut self) {
-        self.part_dirty = true;
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for SegmentCleanupGuard {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        if self.part_dirty {
-            let _ = std::fs::remove_file(&self.part_path);
-        }
-        for index in 0..MAX_SEGMENT_CONCURRENCY {
-            let _ = std::fs::remove_file(segment_path(&self.part_path, index));
-            for candidate in 0..2 {
-                let _ = std::fs::remove_file(tail_candidate_path(
-                    &self.part_path,
-                    index,
-                    candidate,
-                ));
-            }
-        }
-    }
-}
-
-fn response_validator(response: &reqwest::Response) -> ResourceValidator {
-    ResourceValidator {
-        etag: response
-            .headers()
-            .get(header::ETAG)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned),
-        last_modified: response
-            .headers()
-            .get(header::LAST_MODIFIED)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned),
-    }
-}
-
-fn validate_resource_version(
-    expected: &Mutex<Option<ResourceValidator>>,
-    response: &reqwest::Response,
-) -> bool {
-    let candidate = response_validator(response);
-    let mut expected = expected.lock();
-    match expected.as_ref() {
-        Some(expected) => {
-            (expected.etag.is_none() || expected.etag == candidate.etag)
-                && (expected.last_modified.is_none()
-                    || expected.last_modified == candidate.last_modified)
-        }
-        None => {
-            *expected = Some(candidate);
-            true
-        }
-    }
-}
 
 fn segmented_concurrency_cap(available_permits: usize) -> usize {
     available_permits.min(MAX_SEGMENT_CONCURRENCY)
@@ -3636,71 +3441,6 @@ pub(crate) async fn prepare_native_download_routes(
             uses_mirror_first_loader_routes(&request.url, request.resource),
         );
     }
-}
-
-fn segment_path(part_path: &Path, index: usize) -> PathBuf {
-    suffixed_path(part_path, &format!(".segment-{index}"))
-}
-
-fn tail_candidate_path(
-    part_path: &Path,
-    range_index: usize,
-    candidate_index: usize,
-) -> PathBuf {
-    suffixed_path(
-        part_path,
-        &format!(".segment-{range_index}.tail-{candidate_index}"),
-    )
-}
-
-struct TailCandidateCleanupGuard {
-    path: PathBuf,
-    armed: bool,
-}
-
-impl TailCandidateCleanupGuard {
-    fn new(path: PathBuf) -> Self {
-        Self { path, armed: true }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for TailCandidateCleanupGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
-}
-
-struct TailCandidateCompletion {
-    path: PathBuf,
-    final_url: String,
-    remote_addr: Option<std::net::SocketAddr>,
-    http_version: reqwest::Version,
-}
-
-impl Drop for TailCandidateCompletion {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-async fn cleanup_segment_files(
-    part_path: &Path,
-    segment_count: usize,
-) -> crate::Result<()> {
-    for index in 0..segment_count {
-        remove_if_exists(&segment_path(part_path, index)).await?;
-        for candidate in 0..2 {
-            remove_if_exists(&tail_candidate_path(part_path, index, candidate))
-                .await?;
-        }
-    }
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4266,7 +4006,8 @@ async fn try_segmented_download(
     if let Err(error) = cleanup_segment_files(part_path, 256).await {
         return SegmentedDownloadOutcome::Fatal(error);
     }
-    let mut cleanup_guard = SegmentCleanupGuard::new(part_path);
+    let mut cleanup_guard =
+        SegmentCleanupGuard::new(part_path, MAX_SEGMENT_CONCURRENCY);
     let configured_limit = configured_semaphore_limit(semaphore);
     let concurrency_cap =
         route_segmented_concurrency_cap(route, configured_limit);
