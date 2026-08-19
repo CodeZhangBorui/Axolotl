@@ -22,6 +22,7 @@ pub(crate) mod native_reputation;
 pub(crate) mod native_slow;
 pub(crate) mod partial;
 pub(crate) mod range;
+pub(crate) mod request;
 pub mod shared;
 pub mod slow;
 pub mod xmcl;

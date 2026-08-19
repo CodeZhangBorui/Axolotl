@@ -62,6 +62,15 @@ pub(crate) use super::download::range::{
 	create_initial_ranges, expansion_block_reason, initial_segment_count,
 	parse_content_range, should_use_segmented_download,
 };
+pub(crate) use super::download::request::{
+	authority_uses_http1_fallback,
+	byte_range_header_value, is_allowed_download_redirect,
+	is_h2_protocol_failure, record_authority_h2_failure,
+	response_status_error, same_origin, sanitize_url_for_log,
+};
+pub(crate) use super::download::request::is_sensitive_header;
+#[cfg(test)]
+use super::download::request::clear_h2_fallbacks_for_test;
 #[cfg(test)]
 use super::download::range::SEGMENT_EXPANSION_SAMPLE_COUNT;
 
@@ -117,7 +126,6 @@ const FILE_TRANSFER_FIRST_BYTE_TIMEOUT: time::Duration =
 #[cfg(test)]
 const REASSIGNABLE_FIRST_BYTE_TIMEOUT: time::Duration =
     time::Duration::from_millis(500);
-const H2_FALLBACK_TTL: time::Duration = time::Duration::from_secs(600);
 const TASK_PROBE_MAX_ROUTES: usize = 3;
 const MAX_TASK_PROBE_STATES: usize = 64;
 #[cfg(not(test))]
@@ -441,18 +449,6 @@ fn cache_busted_download_url(url: &str, attempt: usize) -> String {
         pairs.append_pair("axolotl_retry", &attempt.to_string());
     }
     parsed.into()
-}
-
-pub(crate) fn sanitize_url_for_log(url: &str) -> String {
-    if let Ok(mut url) = Url::parse(url) {
-        let _ = url.set_username("");
-        let _ = url.set_password(None);
-        url.set_query(None);
-        url.set_fragment(None);
-        return url.into();
-    }
-
-    url.split(['?', '#']).next().unwrap_or(url).to_string()
 }
 
 fn download_error_category(error: &crate::Error) -> &'static str {
@@ -1020,51 +1016,6 @@ pub(crate) static DOWNLOAD_DNS_RESOLVER: LazyLock<Arc<DownloadDnsResolver>> =
     LazyLock::new(|| Arc::new(DownloadDnsResolver::default()));
 static TAIL_HEDGE_SEMAPHORE: LazyLock<Semaphore> =
     LazyLock::new(|| Semaphore::new(MAX_GLOBAL_TAIL_HEDGES));
-static H2_FALLBACK_AUTHORITIES: LazyLock<Mutex<HashMap<String, Instant>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-pub(crate) fn authority_uses_http1_fallback(authority: &str) -> bool {
-    let mut fallbacks = H2_FALLBACK_AUTHORITIES.lock();
-    match fallbacks.get(authority) {
-        Some(until) if *until > Instant::now() => true,
-        Some(_) => {
-            fallbacks.remove(authority);
-            false
-        }
-        None => false,
-    }
-}
-
-pub(crate) fn record_authority_h2_failure(authority: &str) {
-    let now = Instant::now();
-    let mut fallbacks = H2_FALLBACK_AUTHORITIES.lock();
-    fallbacks.retain(|_, until| *until > now);
-    fallbacks.insert(authority.to_string(), now + H2_FALLBACK_TTL);
-}
-
-fn is_h2_protocol_failure(error: &reqwest::Error) -> bool {
-    let mut chain = String::new();
-    let mut source = error.source();
-    while let Some(next) = source {
-        if !chain.is_empty() {
-            chain.push(' ');
-        }
-        chain.push_str(&next.to_string());
-        source = next.source();
-    }
-    let chain = chain.to_ascii_lowercase();
-    [
-        "http2",
-        "http/2",
-        "goaway",
-        "stream error",
-        "protocol error",
-        "refused stream",
-    ]
-    .iter()
-    .any(|marker| chain.contains(marker))
-}
-
 fn reqwest_client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .connect_timeout(FILE_TRANSFER_CONNECT_TIMEOUT)
@@ -1178,13 +1129,6 @@ fn retry_after(response: &reqwest::Response) -> Option<time::Duration> {
         .with_timezone(&Utc);
     let seconds = retry_at.signed_duration_since(Utc::now()).num_seconds();
     Some(time::Duration::from_secs(seconds.clamp(0, 60) as u64))
-}
-
-pub(crate) fn is_sensitive_header(name: &str) -> bool {
-    name.eq_ignore_ascii_case("authorization")
-        || name.eq_ignore_ascii_case("proxy-authorization")
-        || name.eq_ignore_ascii_case("cookie")
-        || name.eq_ignore_ascii_case("x-api-key")
 }
 
 fn header_requires_official_only(name: &str) -> bool {
@@ -2484,60 +2428,6 @@ fn any_route_can_resume(routes: &[DownloadRoute]) -> bool {
     routes
         .iter()
         .any(|route| route.supports_range && range_splitting_allowed(route))
-}
-
-async fn response_status_error(
-    response: reqwest::Response,
-    method: &Method,
-    request_url: &str,
-) -> crate::Error {
-    let status = response.status();
-    if let Ok(mut error) = response.json::<LabrinthError>().await {
-        error.status = Some(status.as_u16());
-        error.method = Some(method.as_str().to_string());
-        error.url = Some(sanitize_url_for_log(request_url));
-        ErrorKind::LabrinthError(error).into()
-    } else {
-        ErrorKind::HttpError {
-            status: status.as_u16(),
-            method: method.as_str().to_string(),
-            url: sanitize_url_for_log(request_url),
-        }
-        .into()
-    }
-}
-
-fn same_origin(left: &Url, right: &Url) -> bool {
-    left.scheme() == right.scheme()
-        && left.host_str() == right.host_str()
-        && left.port_or_known_default() == right.port_or_known_default()
-}
-
-fn is_allowed_download_redirect(url: &Url) -> bool {
-    if url.scheme() == "https" {
-        return true;
-    }
-    #[cfg(test)]
-    if url.scheme() == "http"
-        && url
-            .host_str()
-            .is_some_and(|host| host == "localhost" || host == "127.0.0.1")
-    {
-        return true;
-    }
-    false
-}
-
-fn byte_range_header_value(
-    range_start: Option<u64>,
-    range_end: Option<u64>,
-) -> Option<String> {
-    range_start.map(|start| {
-        range_end.map_or_else(
-            || format!("bytes={start}-"),
-            |end| format!("bytes={start}-{end}"),
-        )
-    })
 }
 
 async fn send_path_request_with_clients(
@@ -8050,6 +7940,6 @@ mod tests {
         record_authority_h2_failure("example.com:443");
         assert!(authority_uses_http1_fallback("example.com:443"));
         assert!(!authority_uses_http1_fallback("other.com:443"));
-        H2_FALLBACK_AUTHORITIES.lock().clear();
+        clear_h2_fallbacks_for_test();
     }
 }
