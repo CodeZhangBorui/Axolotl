@@ -4,7 +4,7 @@ use super::download_manager::{DownloadSpeedTracker, SpeedSnapshot};
 use super::io::{self, IOError};
 use crate::event::LoadingBarId;
 use crate::event::emit::emit_loading;
-use crate::install::{DownloadItemStatus, InstallProgressReporter};
+use crate::install::DownloadItemStatus;
 use crate::{ErrorKind, LabrinthError};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -14,8 +14,6 @@ use parking_lot::Mutex;
 use rand::Rng;
 use reqwest::{Method, StatusCode, header};
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256, Sha512};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::ffi::OsStr;
@@ -23,7 +21,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{
-    Arc, LazyLock, Weak,
+    Arc, LazyLock,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::{self, Instant};
@@ -34,6 +32,23 @@ use tokio::{
 };
 use url::Url;
 use uuid::Uuid;
+
+pub use super::download::model::{
+	ContentValidation, DownloadMeta, DownloadReason, DownloadRequest,
+	DownloadResult, DownloadRoute, DownloadRouteSource, FetchSemaphore,
+	Integrity, IoSemaphore, ProxyPolicy, ResourceClass,
+};
+pub(crate) use super::download::integrity::{
+	ComputedIntegrity, IntegrityHashers, hash_existing_part_prefix,
+	is_integrity_error, validate_file_content, verify_computed_integrity,
+	verify_file,
+};
+pub use super::download::partial::cleanup_stale_partial_downloads;
+pub(crate) use super::download::partial::{
+	create_download_file, finalize_download, in_flight_download_lock,
+	open_download_file_for_append, part_resume_expected,
+	preserve_or_remove_partial, remove_if_exists, suffixed_path,
+};
 
 pub const DOWNLOAD_META_HEADER: &str = "modrinth-download-meta";
 
@@ -107,228 +122,6 @@ const TASK_PROBE_MAX_WAIT: time::Duration = time::Duration::from_secs(10);
 #[cfg(test)]
 const TASK_PROBE_MAX_WAIT: time::Duration = time::Duration::from_secs(2);
 const COLD_START_ROUTE_HEALTH_SAMPLE_THRESHOLD: u32 = 2;
-
-#[derive(
-    Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum ResourceClass {
-    Metadata,
-    MinecraftAsset,
-    MinecraftLibrary,
-    Loader,
-    Java,
-    Modrinth,
-    CurseForge,
-    Modpack,
-    #[default]
-    Other,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DownloadRouteSource {
-    Official,
-    Bmclapi,
-    Mcim,
-    Tianpao,
-    Alternate,
-}
-
-impl DownloadRouteSource {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Official => "official",
-            Self::Bmclapi => "bmclapi",
-            Self::Mcim => "mcim",
-            Self::Tianpao => "tianpao",
-            Self::Alternate => "alternate",
-        }
-    }
-}
-
-#[derive(
-    Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum ProxyPolicy {
-    #[default]
-    System,
-    Direct,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct DownloadRoute {
-    pub url: String,
-    pub source: DownloadRouteSource,
-    pub is_mirror: bool,
-    pub allow_sensitive_headers: bool,
-    pub supports_range: bool,
-    pub proxy: ProxyPolicy,
-}
-
-#[derive(
-    Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum ContentValidation {
-    #[default]
-    None,
-    Json,
-    Jar,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct Integrity {
-    pub size: Option<u64>,
-    pub sha1: Option<String>,
-    pub sha512: Option<String>,
-    pub sha256: Option<String>,
-    pub md5: Option<String>,
-    pub content: ContentValidation,
-}
-
-impl Integrity {
-    pub fn sha1(hash: impl Into<String>) -> Self {
-        Self {
-            sha1: Some(hash.into()),
-            ..Self::default()
-        }
-    }
-
-    pub fn with_size(mut self, size: u64) -> Self {
-        self.size = Some(size);
-        self
-    }
-
-    pub fn with_content_validation(
-        mut self,
-        content: ContentValidation,
-    ) -> Self {
-        self.content = content;
-        self
-    }
-
-    fn is_empty(&self) -> bool {
-        self.size.is_none()
-            && self.sha1.is_none()
-            && self.sha512.is_none()
-            && self.sha256.is_none()
-            && self.md5.is_none()
-            && self.content == ContentValidation::None
-    }
-
-    /// Resuming a partial download is only safe when a content hash can
-    /// prove the stitched-together file is what the server intended.
-    pub(crate) fn supports_resume(&self) -> bool {
-        self.size.is_some() && self.has_hash()
-    }
-
-    fn has_hash(&self) -> bool {
-        self.sha1.is_some()
-            || self.sha512.is_some()
-            || self.sha256.is_some()
-            || self.md5.is_some()
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct DownloadRequest {
-    pub url: String,
-    pub resource: ResourceClass,
-    pub integrity: Integrity,
-    pub download_meta: Option<DownloadMeta>,
-    pub header: Option<(String, String)>,
-    pub candidate_urls: Vec<String>,
-    /// Whether range-segmented (multi-connection) downloading is allowed.
-    /// Batch schedulers disable it so many small files share one connection
-    /// budget instead of each file multiplying its connections.
-    pub allow_segmented_download: bool,
-    pub(crate) install_tracking: Option<DownloadInstallTracking>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct DownloadInstallTracking {
-    pub(crate) reporter: InstallProgressReporter,
-    pub(crate) item_id: String,
-    pub(crate) item_name: String,
-}
-
-impl DownloadRequest {
-    pub fn new(url: impl Into<String>, resource: ResourceClass) -> Self {
-        Self {
-            url: url.into(),
-            resource,
-            integrity: Integrity::default(),
-            download_meta: None,
-            header: None,
-            candidate_urls: Vec::new(),
-            allow_segmented_download: true,
-            install_tracking: None,
-        }
-    }
-
-    pub fn with_segmented_download(mut self, allow: bool) -> Self {
-        self.allow_segmented_download = allow;
-        self
-    }
-
-    pub fn with_integrity(mut self, integrity: Integrity) -> Self {
-        self.integrity = integrity;
-        self
-    }
-
-    pub fn with_download_meta(mut self, download_meta: DownloadMeta) -> Self {
-        self.download_meta = Some(download_meta);
-        self
-    }
-
-    pub fn with_header(
-        mut self,
-        name: impl Into<String>,
-        value: impl Into<String>,
-    ) -> Self {
-        self.header = Some((name.into(), value.into()));
-        self
-    }
-
-    pub fn with_candidate_urls<I, S>(mut self, urls: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.candidate_urls.extend(urls.into_iter().map(Into::into));
-        self
-    }
-
-    pub fn with_install_tracking(
-        mut self,
-        reporter: InstallProgressReporter,
-        item_id: impl Into<String>,
-        item_name: impl Into<String>,
-    ) -> Self {
-        self.install_tracking = Some(DownloadInstallTracking {
-            reporter,
-            item_id: item_id.into(),
-            item_name: item_name.into(),
-        });
-        self
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct DownloadResult {
-    pub path: PathBuf,
-    pub url: String,
-    pub source: DownloadRouteSource,
-    pub size: u64,
-    pub attempts: usize,
-    pub fallback_count: usize,
-}
-
-static IN_FLIGHT_DOWNLOADS: LazyLock<
-    dashmap::DashMap<String, Weak<AsyncMutex<()>>>,
-> = LazyLock::new(dashmap::DashMap::new);
 
 const ROUTE_HEALTH_ALPHA: f64 = 0.25;
 
@@ -1329,52 +1122,10 @@ fn infer_resource_class(url: &str) -> ResourceClass {
     }
 }
 
-#[derive(Debug, derive_more::Display, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[display(rename_all = "snake_case")]
-pub enum DownloadReason {
-    Standalone,
-    Dependency,
-    Modpack,
-    Update,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct DownloadMeta {
-    pub reason: DownloadReason,
-    pub game_version: String,
-    pub loader: String,
-    pub dependent_on: Option<String>,
-}
-
-impl DownloadMeta {
-    pub fn to_header_value(&self) -> String {
-        serde_json::to_string(self).unwrap_or_default()
-    }
-}
-
-#[derive(Debug)]
-pub struct IoSemaphore(pub Semaphore);
-#[derive(Debug)]
-pub struct FetchSemaphore(pub Semaphore);
-
 pub(crate) static DOWNLOAD_DNS_RESOLVER: LazyLock<Arc<DownloadDnsResolver>> =
     LazyLock::new(|| Arc::new(DownloadDnsResolver::default()));
 static TAIL_HEDGE_SEMAPHORE: LazyLock<Semaphore> =
     LazyLock::new(|| Semaphore::new(MAX_GLOBAL_TAIL_HEDGES));
-static FILE_VALIDATION_SEMAPHORE: LazyLock<Semaphore> =
-    LazyLock::new(|| Semaphore::new(4));
-
-async fn acquire_native_validation_permit()
--> crate::Result<Option<SemaphorePermit<'static>>> {
-    if crate::util::download::active_engine()
-        == crate::util::download::DownloadEngine::XmclCompat
-    {
-        return Ok(None);
-    }
-    Ok(Some(FILE_VALIDATION_SEMAPHORE.acquire().await?))
-}
-
 static H2_FALLBACK_AUTHORITIES: LazyLock<Mutex<HashMap<String, Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -2834,381 +2585,10 @@ async fn fetch_advanced_with_client_and_progress(
     ))
 }
 
-#[derive(Default)]
-pub(crate) struct IntegrityHashers {
-    sha1: Option<sha1_smol::Sha1>,
-    sha512: Option<Sha512>,
-    sha256: Option<Sha256>,
-    md5: Option<md5::Context>,
-}
-
-#[derive(Default)]
-pub(crate) struct ComputedIntegrity {
-    size: u64,
-    sha1: Option<String>,
-    sha512: Option<String>,
-    sha256: Option<String>,
-    md5: Option<String>,
-}
-
-impl IntegrityHashers {
-    pub(crate) fn new_integrity_hashers(integrity: &Integrity) -> Self {
-        Self {
-            sha1: integrity.sha1.as_ref().map(|_| sha1_smol::Sha1::new()),
-            sha512: integrity.sha512.as_ref().map(|_| Sha512::new()),
-            sha256: integrity.sha256.as_ref().map(|_| Sha256::new()),
-            md5: integrity.md5.as_ref().map(|_| md5::Context::new()),
-        }
-    }
-
-    pub(crate) fn update(&mut self, bytes: &[u8]) {
-        if let Some(hasher) = &mut self.sha1 {
-            hasher.update(bytes);
-        }
-        if let Some(hasher) = &mut self.sha512 {
-            hasher.update(bytes);
-        }
-        if let Some(hasher) = &mut self.sha256 {
-            hasher.update(bytes);
-        }
-        if let Some(hasher) = &mut self.md5 {
-            hasher.consume(bytes);
-        }
-    }
-
-    pub(crate) fn finish(self, size: u64) -> ComputedIntegrity {
-        ComputedIntegrity {
-            size,
-            sha1: self.sha1.map(|hasher| hasher.digest().to_string()),
-            sha512: self
-                .sha512
-                .map(|hasher| format!("{:x}", hasher.finalize())),
-            sha256: self
-                .sha256
-                .map(|hasher| format!("{:x}", hasher.finalize())),
-            md5: self.md5.map(|hasher| format!("{:x}", hasher.finalize())),
-        }
-    }
-}
-
-pub(crate) fn suffixed_path(path: &Path, suffix: &str) -> PathBuf {
-    let mut value = path.as_os_str().to_os_string();
-    value.push(suffix);
-    PathBuf::from(value)
-}
-
-async fn remove_if_exists(path: &Path) -> crate::Result<()> {
-    match io::retry_windows_sharing_violation(path, "removing", || {
-        tokio::fs::remove_file(path)
-    })
-    .await
-    {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(io::io_error_with_lock_info(error, path).into()),
-    }
-}
-
-async fn create_download_file(path: &Path) -> Result<File, IOError> {
-    io::retry_windows_sharing_violation(path, "creating download file", || {
-        File::create(path)
-    })
-    .await
-    .map_err(|error| io::io_error_with_lock_info(error, path))
-}
-
-async fn open_download_file_for_append(path: &Path) -> Result<File, IOError> {
-    io::retry_windows_sharing_violation(
-        path,
-        "opening download file",
-        || async {
-            tokio::fs::OpenOptions::new().append(true).open(path).await
-        },
-    )
-    .await
-    .map_err(|error| io::io_error_with_lock_info(error, path))
-}
-
-/// Keeps a partial `.part` file for a later resume when the download can be
-/// safely resumed, at least one route could actually serve a resume, and some
-/// data has already arrived; removes it otherwise so unusable partial data
-/// does not accumulate on disk.
-async fn preserve_or_remove_partial(
-    part_path: &Path,
-    integrity: &Integrity,
-    routes_can_resume: bool,
-) -> crate::Result<()> {
-    let resumable = routes_can_resume
-        && integrity.supports_resume()
-        && tokio::fs::metadata(part_path)
-            .await
-            .is_ok_and(|metadata| metadata.len() > 0);
-    if !resumable {
-        remove_if_exists(part_path).await?;
-    }
-    Ok(())
-}
-
 fn any_route_can_resume(routes: &[DownloadRoute]) -> bool {
     routes
         .iter()
         .any(|route| route.supports_range && range_splitting_allowed(route))
-}
-
-/// Whether a `.part` file with resume data exists at `part_path`. The
-/// multiplexed path starts from scratch; resume is handled by the legacy
-/// path so a partially downloaded file is never lost.
-async fn part_resume_expected(part_path: &Path) -> bool {
-    tokio::fs::metadata(part_path)
-        .await
-        .map(|metadata| metadata.len() > 0)
-        .unwrap_or(false)
-}
-
-const STALE_PARTIAL_DOWNLOAD_MAX_AGE: time::Duration =
-    time::Duration::from_secs(7 * 24 * 60 * 60);
-
-fn is_partial_download_file_name(name: &str) -> bool {
-    name.ends_with(".part")
-        || name
-            .rsplit_once(".segment-")
-            .is_some_and(|(prefix, index)| {
-                prefix.ends_with(".part")
-                    && !index.is_empty()
-                    && index.bytes().all(|byte| byte.is_ascii_digit())
-            })
-}
-
-/// Removes partial download files under launcher-managed directories that
-/// have not been written to for a week. Partial data is preserved between
-/// attempts so interrupted downloads can resume, but destinations that are
-/// never requested again (for example superseded modpack versions) would
-/// otherwise accumulate multi-gigabyte litter forever.
-pub fn cleanup_stale_partial_downloads(directories: Vec<PathBuf>) {
-    tokio::task::spawn_blocking(move || {
-        let Some(cutoff) = std::time::SystemTime::now()
-            .checked_sub(STALE_PARTIAL_DOWNLOAD_MAX_AGE)
-        else {
-            return;
-        };
-        let mut pending = directories;
-        let mut removed = 0_u64;
-        while let Some(directory) = pending.pop() {
-            let Ok(entries) = std::fs::read_dir(&directory) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let Ok(file_type) = entry.file_type() else {
-                    continue;
-                };
-                if file_type.is_dir() {
-                    pending.push(entry.path());
-                    continue;
-                }
-                if !file_type.is_file()
-                    || !is_partial_download_file_name(
-                        &entry.file_name().to_string_lossy(),
-                    )
-                {
-                    continue;
-                }
-                let stale = entry
-                    .metadata()
-                    .and_then(|metadata| metadata.modified())
-                    .is_ok_and(|modified| modified < cutoff);
-                if stale && std::fs::remove_file(entry.path()).is_ok() {
-                    removed += 1;
-                }
-            }
-        }
-        if removed > 0 {
-            tracing::info!(removed, "Removed stale partial download files");
-        }
-    });
-}
-
-/// Feeds an existing partial download into fresh integrity hashers so a
-/// resumed transfer can continue hashing where the file left off. Returns
-/// `None` when the file cannot be read back or its length changed.
-async fn hash_existing_part_prefix(
-    path: &Path,
-    integrity: &Integrity,
-    expected_len: u64,
-) -> Option<IntegrityHashers> {
-    let mut file = File::open(path).await.ok()?;
-    let mut hashers = IntegrityHashers::new_integrity_hashers(integrity);
-    let mut size = 0_u64;
-    let mut buffer = vec![0_u8; 256 * 1024];
-    loop {
-        let read = file.read(&mut buffer).await.ok()?;
-        if read == 0 {
-            break;
-        }
-        hashers.update(&buffer[..read]);
-        size += read as u64;
-    }
-    (size == expected_len).then_some(hashers)
-}
-
-async fn compute_file_integrity(
-    path: &Path,
-    integrity: &Integrity,
-) -> crate::Result<ComputedIntegrity> {
-    let _permit = acquire_native_validation_permit().await?;
-    let mut file = File::open(path)
-        .await
-        .map_err(|error| IOError::with_path(error, path))?;
-    let mut hashers = IntegrityHashers::new_integrity_hashers(integrity);
-    let mut size = 0;
-    let mut buffer = vec![0_u8; 256 * 1024];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .await
-            .map_err(|error| IOError::with_path(error, path))?;
-        if read == 0 {
-            break;
-        }
-        hashers.update(&buffer[..read]);
-        size += read as u64;
-    }
-    Ok(hashers.finish(size))
-}
-
-pub(crate) fn verify_computed_integrity(
-    expected: &Integrity,
-    actual: &ComputedIntegrity,
-) -> crate::Result<()> {
-    if let Some(size) = expected.size
-        && actual.size != size
-    {
-        // A broken CDN cache or a pack manifest that disagrees with the real
-        // file by a few bytes must not reject content that hashes correctly:
-        // the hash is authoritative whenever one is available.
-        if !expected.has_hash() {
-            return Err(ErrorKind::OtherError(format!(
-                "Incorrect size for download: {size} != {}",
-                actual.size
-            ))
-            .into());
-        }
-        tracing::warn!(
-            expected_size = size,
-            actual_size = actual.size,
-            "Downloaded size differs from the expected size; relying on content hash verification"
-        );
-    }
-
-    let checks = [
-        ("sha1", expected.sha1.as_ref(), actual.sha1.as_ref()),
-        ("sha512", expected.sha512.as_ref(), actual.sha512.as_ref()),
-        ("sha256", expected.sha256.as_ref(), actual.sha256.as_ref()),
-        ("md5", expected.md5.as_ref(), actual.md5.as_ref()),
-    ];
-    for (algorithm, expected, actual) in checks {
-        if let Some(expected) = expected
-            && actual
-                .is_none_or(|actual| !actual.eq_ignore_ascii_case(expected))
-        {
-            return Err(ErrorKind::OtherError(format!(
-                "Incorrect {algorithm} hash for download: {expected} != {}",
-                actual.map(String::as_str).unwrap_or("not computed")
-            ))
-            .into());
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn is_integrity_error(error: &crate::Error) -> bool {
-    match error.raw.as_ref() {
-        ErrorKind::HashError(..) => true,
-        ErrorKind::OtherError(message) => {
-            message.starts_with("Incorrect ")
-                && message.contains(" hash for download")
-        }
-        _ => false,
-    }
-}
-
-pub(crate) async fn validate_file_content(
-    path: &Path,
-    validation: ContentValidation,
-) -> crate::Result<()> {
-    if validation == ContentValidation::None {
-        return Ok(());
-    }
-    let _permit = acquire_native_validation_permit().await?;
-    let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || -> crate::Result<()> {
-        let file = std::fs::File::open(&path)
-            .map_err(|error| IOError::with_path(error, &path))?;
-        match validation {
-            ContentValidation::None => {}
-            ContentValidation::Json => {
-                serde_json::from_reader::<_, serde_json::Value>(file)?;
-            }
-            ContentValidation::Jar => {
-                zip::ZipArchive::new(file).map_err(|error| {
-                    ErrorKind::OtherError(format!(
-                        "Invalid JAR archive {}: {error}",
-                        path.display()
-                    ))
-                })?;
-            }
-        }
-        Ok(())
-    })
-    .await??;
-    Ok(())
-}
-
-pub(crate) async fn verify_file(
-    path: &Path,
-    integrity: &Integrity,
-) -> crate::Result<u64> {
-    let computed = compute_file_integrity(path, integrity).await?;
-    verify_computed_integrity(integrity, &computed)?;
-    validate_file_content(path, integrity.content).await?;
-    Ok(computed.size)
-}
-
-/// Keys the in-flight download lock on the destination path, so concurrent
-/// downloads writing the same file (and thus the same sibling `.part` file)
-/// serialize even when they expect different content. Uppercasing mirrors
-/// NTFS `$UpCase` comparison semantics; unlike lowercasing it has no
-/// context-sensitive folds that could split one on-disk file into two keys.
-fn download_lock_key(destination: &Path) -> String {
-    let path = destination.display().to_string();
-    if cfg!(windows) {
-        path.to_uppercase()
-    } else {
-        path
-    }
-}
-
-fn in_flight_download_lock(key: String) -> Arc<AsyncMutex<()>> {
-    use dashmap::mapref::entry::Entry;
-
-    if IN_FLIGHT_DOWNLOADS.len() > 4_096 {
-        IN_FLIGHT_DOWNLOADS.retain(|_, lock| lock.strong_count() > 0);
-    }
-    match IN_FLIGHT_DOWNLOADS.entry(key) {
-        Entry::Occupied(mut entry) => {
-            if let Some(lock) = entry.get().upgrade() {
-                lock
-            } else {
-                let lock = Arc::new(AsyncMutex::new(()));
-                entry.insert(Arc::downgrade(&lock));
-                lock
-            }
-        }
-        Entry::Vacant(entry) => {
-            let lock = Arc::new(AsyncMutex::new(()));
-            entry.insert(Arc::downgrade(&lock));
-            lock
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3261,34 +2641,6 @@ async fn response_status_error(
         }
         .into()
     }
-}
-
-pub(crate) async fn finalize_download(
-    part_path: &Path,
-    destination: &Path,
-) -> crate::Result<()> {
-    if io::retry_windows_sharing_violation(destination, "checking", || {
-        tokio::fs::try_exists(destination)
-    })
-    .await
-    .map_err(|error| io::io_error_with_lock_info(error, destination))?
-    {
-        remove_if_exists(destination).await?;
-    }
-    io::retry_windows_sharing_violation(
-        destination,
-        "finalizing download",
-        || tokio::fs::rename(part_path, destination),
-    )
-    .await
-    .map_err(|error| {
-        io::io_error_with_lock_info_for_paths(
-            error,
-            destination,
-            &[destination, part_path],
-        )
-    })?;
-    Ok(())
 }
 
 fn same_origin(left: &Url, right: &Url) -> bool {
@@ -5491,8 +4843,7 @@ async fn download_to_path_inner(
     if let Some(parent) = destination.parent() {
         io::create_dir_all(parent).await?;
     }
-    let lock_key = download_lock_key(destination);
-    let download_lock = in_flight_download_lock(lock_key);
+    let download_lock = in_flight_download_lock(destination);
     let _download_guard = download_lock.lock().await;
     let mode = source_mode_for_resource(request.resource);
     let mut routes = {
