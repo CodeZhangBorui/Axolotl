@@ -1,6 +1,8 @@
 //! Functions for fetching information from the Internet
 use super::download_dns::DownloadDnsResolver;
-use super::download_manager::{DownloadSpeedTracker, SpeedSnapshot};
+use super::download_manager::DownloadSpeedTracker;
+#[cfg(test)]
+use super::download_manager::SpeedSnapshot;
 use super::io::{self, IOError};
 use crate::event::LoadingBarId;
 use crate::event::emit::emit_loading;
@@ -14,7 +16,7 @@ use parking_lot::Mutex;
 use rand::Rng;
 use reqwest::{Method, StatusCode, header};
 use serde::de::DeserializeOwned;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::ffi::OsStr;
 use std::future::Future;
@@ -55,8 +57,13 @@ pub(crate) use super::download::range::{
 	DownloadRangeGuard, ResourceValidator,
 	SegmentCleanupGuard, SegmentDownloadCompletion, SegmentDownloadError,
 	SegmentedDownloadSuccess, TailCandidateCleanupGuard,
-	TailCandidateCompletion,
+	TailCandidateCompletion, SEGMENTED_DOWNLOAD_THRESHOLD, MIN_SEGMENT_SIZE,
+	SEGMENT_EXPANSION_INTERVAL,
+	create_initial_ranges, expansion_block_reason, initial_segment_count,
+	parse_content_range, should_use_segmented_download,
 };
+#[cfg(test)]
+use super::download::range::SEGMENT_EXPANSION_SAMPLE_COUNT;
 
 pub const DOWNLOAD_META_HEADER: &str = "modrinth-download-meta";
 
@@ -71,17 +78,11 @@ const METADATA_ATTEMPT_BUDGET: usize = 4;
 const METADATA_HEDGE_DELAY: time::Duration = time::Duration::from_secs(2);
 #[cfg(test)]
 const METADATA_HEDGE_DELAY: time::Duration = time::Duration::from_millis(100);
-const SEGMENTED_DOWNLOAD_THRESHOLD: u64 = 4 * 1024 * 1024;
-const INITIAL_SEGMENT_CONCURRENCY: usize = 4;
 const MAX_SEGMENT_CONCURRENCY: usize = 4;
-const MIN_SEGMENT_SIZE: u64 = 256 * 1024;
 const ROUTE_PROBE_BYTES: u64 = 256 * 1024;
 const ROUTE_PROBE_MIN_IMPROVEMENT_PERCENT: u64 = 25;
 const ROUTE_PROBE_TIMEOUT: time::Duration = time::Duration::from_secs(5);
 const SEGMENT_RETRY_ATTEMPTS: usize = 3;
-const SEGMENT_EXPANSION_SAMPLE_COUNT: usize = 3;
-const SEGMENT_EXPANSION_INTERVAL: time::Duration =
-    time::Duration::from_millis(1500);
 #[cfg(not(test))]
 const RANGE_IDLE_RECONNECT_TIMEOUT: time::Duration =
     time::Duration::from_secs(8);
@@ -116,8 +117,6 @@ const FILE_TRANSFER_FIRST_BYTE_TIMEOUT: time::Duration =
 #[cfg(test)]
 const REASSIGNABLE_FIRST_BYTE_TIMEOUT: time::Duration =
     time::Duration::from_millis(500);
-const MAX_DOWNLOAD_ATTEMPT_HISTORY: usize = 12;
-const MAX_DOWNLOAD_DIAGNOSTIC_BYTES: usize = 8 * 1024;
 const H2_FALLBACK_TTL: time::Duration = time::Duration::from_secs(600);
 const TASK_PROBE_MAX_ROUTES: usize = 3;
 const MAX_TASK_PROBE_STATES: usize = 64;
@@ -456,109 +455,17 @@ pub(crate) fn sanitize_url_for_log(url: &str) -> String {
     url.split(['?', '#']).next().unwrap_or(url).to_string()
 }
 
-#[derive(Debug)]
-struct DownloadAttemptDiagnostic {
-    attempt: usize,
-    source: DownloadRouteSource,
-    url: String,
-    proxy: ProxyPolicy,
-    dns_candidates: Vec<std::net::IpAddr>,
-    remote_addr: Option<std::net::SocketAddr>,
-    http_version: Option<reqwest::Version>,
-    status: Option<u16>,
-    category: &'static str,
-    decision: &'static str,
-    detail: String,
-}
-
-fn bounded_diagnostic_text(value: impl AsRef<str>, max_chars: usize) -> String {
-    value.as_ref().chars().take(max_chars).collect()
-}
-
 fn download_error_category(error: &crate::Error) -> &'static str {
-    match error.raw.as_ref() {
-        ErrorKind::FetchError(source) => {
-            let detail = format!("{source:?}").to_ascii_lowercase();
-            if source.status().is_some() {
-                "http"
-            } else if source.is_timeout() && source.is_body() {
-                "stall"
-            } else if source.is_timeout() {
-                "timeout"
-            } else if source.is_connect()
-                && ["certificate", "tls", "ssl"]
-                    .iter()
-                    .any(|needle| detail.contains(needle))
-            {
-                "tls"
-            } else if source.is_connect()
-                && ["dns", "lookup", "resolve"]
-                    .iter()
-                    .any(|needle| detail.contains(needle))
-            {
-                "dns"
-            } else if source.is_connect() {
-                "connect"
-            } else {
-                "network"
-            }
-        }
-        ErrorKind::NetworkError(message) => {
-            if message.contains("no response received") {
-                "timeout"
-            } else {
-                "network"
-            }
-        }
-        ErrorKind::LabrinthError(_) | ErrorKind::HttpError { .. } => "http",
-        ErrorKind::HashError(_, _) => "integrity",
-        ErrorKind::JSONError(_) => "integrity",
-        ErrorKind::IOError(_) | ErrorKind::StdIOError(_) => "io",
-        ErrorKind::OtherError(message) => {
-            let message = message.to_ascii_lowercase();
-            if message.contains("content-range") || message.contains("range") {
-                "range"
-            } else if message.contains("integrity")
-                || message.contains("checksum")
-                || message.contains("validation")
-            {
-                "integrity"
-            } else if message.contains("truncated") {
-                "stall"
-            } else {
-                "other"
-            }
-        }
-        _ => "other",
-    }
+    crate::util::download::diagnostics::error_category(error)
 }
 
 fn download_error_detail(error: &crate::Error) -> String {
-    match error.raw.as_ref() {
-        ErrorKind::FetchError(source) => source.status().map_or_else(
-            || format!("{} failure", download_error_category(error)),
-            |status| format!("HTTP {}", status.as_u16()),
-        ),
-        ErrorKind::LabrinthError(error) => error.status.map_or_else(
-            || "API response failure".to_string(),
-            |status| format!("HTTP {status}"),
-        ),
-        ErrorKind::HttpError { status, .. } => format!("HTTP {status}"),
-        ErrorKind::HashError(_, _) => "hash mismatch".to_string(),
-        ErrorKind::JSONError(_) => "JSON validation failed".to_string(),
-        ErrorKind::IOError(_) | ErrorKind::StdIOError(_) => {
-            "I/O failure".to_string()
-        }
-        ErrorKind::OtherError(_) | ErrorKind::NetworkError(_) => {
-            format!("{} failure", download_error_category(error))
-        }
-        _ => bounded_diagnostic_text(error.to_string(), 256),
-    }
+    crate::util::download::diagnostics::error_detail(error)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn push_download_attempt_diagnostic(
-    history: &mut VecDeque<DownloadAttemptDiagnostic>,
+    history: &mut crate::util::download::diagnostics::DownloadAttemptHistory,
     route: &DownloadRoute,
     attempt: usize,
     category: &'static str,
@@ -568,33 +475,31 @@ fn push_download_attempt_diagnostic(
     remote_addr: Option<std::net::SocketAddr>,
     http_version: Option<reqwest::Version>,
 ) {
-    if history.len() == MAX_DOWNLOAD_ATTEMPT_HISTORY {
-        history.pop_front();
-    }
     let dns_candidates = route_host(route)
         .map(|host| DOWNLOAD_DNS_RESOLVER.resolved_addresses(&host))
         .unwrap_or_default()
         .into_iter()
         .take(8)
         .collect();
-    history.push_back(DownloadAttemptDiagnostic {
+    crate::util::download::diagnostics::push(
+        history,
         attempt,
-        source: route.source,
-        url: bounded_diagnostic_text(sanitize_url_for_log(&route.url), 512),
-        proxy: route.proxy,
+        route.source,
+        &sanitize_url_for_log(&route.url),
+        route.proxy,
         dns_candidates,
-        remote_addr,
-        http_version,
-        status: status.map(|status| status.as_u16()),
         category,
         decision,
-        detail: bounded_diagnostic_text(detail, 256),
-    });
+        detail,
+        status,
+        remote_addr,
+        http_version,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
 fn record_download_attempt_failure(
-    history: &mut VecDeque<DownloadAttemptDiagnostic>,
+    history: &mut crate::util::download::diagnostics::DownloadAttemptHistory,
     route: &DownloadRoute,
     attempt: usize,
     error: &crate::Error,
@@ -618,35 +523,16 @@ fn record_download_attempt_failure(
 
 fn attach_download_attempt_history(
     error: crate::Error,
-    history: &VecDeque<DownloadAttemptDiagnostic>,
+    history: &crate::util::download::diagnostics::DownloadAttemptHistory,
     attempts: usize,
     attempt_budget: usize,
 ) -> crate::Error {
-    let mut context = format!(
-        "Download failed after {attempts}/{attempt_budget} attempts. Recent attempt history:"
-    );
-    for item in history {
-        let line = format!(
-            "\n- attempt={}; source={}; url={}; proxy={:?}; dns={:?}; remote={:?}; http={:?}; status={:?}; category={}; decision={}; detail={}",
-            item.attempt,
-            item.source.as_str(),
-            item.url,
-            item.proxy,
-            item.dns_candidates,
-            item.remote_addr,
-            item.http_version,
-            item.status,
-            item.category,
-            item.decision,
-            item.detail,
-        );
-        if context.len() + line.len() > MAX_DOWNLOAD_DIAGNOSTIC_BYTES {
-            context.push_str("\n- older diagnostic details omitted");
-            break;
-        }
-        context.push_str(&line);
-    }
-    error.with_context(context)
+    crate::util::download::diagnostics::attach(
+        error,
+        history,
+        attempts,
+        attempt_budget,
+    )
 }
 
 fn is_safe_redirect_location(location: &str) -> bool {
@@ -1902,7 +1788,8 @@ async fn fetch_advanced_with_client_and_progress(
 
     let mut total_attempts = 0;
     let mut last_error = None;
-    let mut attempt_history = VecDeque::new();
+    let mut attempt_history =
+        crate::util::download::diagnostics::DownloadAttemptHistory::new();
     let hedge_is_safe = method == Method::GET
         && json_body.is_none()
         && download_meta.is_none()
@@ -2599,37 +2486,6 @@ fn any_route_can_resume(routes: &[DownloadRoute]) -> bool {
         .any(|route| route.supports_range && range_splitting_allowed(route))
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ParsedContentRange {
-    start: u64,
-    end: u64,
-    /// `None` when the server reports an unknown complete length (`*`),
-    /// which RFC 9110 permits on a 206 response.
-    total: Option<u64>,
-}
-
-fn parse_content_range(
-    response: &reqwest::Response,
-) -> Option<ParsedContentRange> {
-    let value = response
-        .headers()
-        .get(header::CONTENT_RANGE)?
-        .to_str()
-        .ok()?
-        .strip_prefix("bytes ")?;
-    let (range, total) = value.split_once('/')?;
-    let (start, end) = range.split_once('-')?;
-    Some(ParsedContentRange {
-        start: start.parse().ok()?,
-        end: end.parse().ok()?,
-        total: if total == "*" {
-            None
-        } else {
-            Some(total.parse().ok()?)
-        },
-    })
-}
-
 async fn response_status_error(
     response: reqwest::Response,
     method: &Method,
@@ -2983,58 +2839,6 @@ fn try_acquire_native_connection<'a>(
     })
 }
 
-fn initial_segment_count(size: u64, available_permits: usize) -> usize {
-    let size_limit = usize::try_from(size / MIN_SEGMENT_SIZE)
-        .unwrap_or(usize::MAX)
-        .max(1);
-    INITIAL_SEGMENT_CONCURRENCY
-        .min(segmented_concurrency_cap(available_permits))
-        .min(size_limit)
-}
-
-fn create_initial_ranges(size: u64, count: usize) -> Vec<DownloadRange> {
-    let base_size = size / count as u64;
-    let remainder = size % count as u64;
-    let mut start = 0_u64;
-    (0..count)
-        .map(|index| {
-            let range_size = base_size + u64::from(index < remainder as usize);
-            let end = start + range_size - 1;
-            let range = DownloadRange::new(index, start, end);
-            start = end + 1;
-            range
-        })
-        .collect()
-}
-
-fn expansion_block_reason(
-    snapshot: SpeedSnapshot,
-    active_ranges: usize,
-    concurrency_cap: usize,
-    available_permits: usize,
-    remaining_bytes: u64,
-    elapsed_since_expansion: time::Duration,
-) -> Option<&'static str> {
-    if active_ranges >= concurrency_cap {
-        return Some("effective concurrency cap reached");
-    }
-    if available_permits == 0 {
-        return Some("no global permit available");
-    }
-    if elapsed_since_expansion < SEGMENT_EXPANSION_INTERVAL {
-        return Some("expansion cooldown active");
-    }
-    if snapshot.sample_count < SEGMENT_EXPANSION_SAMPLE_COUNT {
-        return Some("insufficient aggregate speed samples");
-    }
-    if remaining_bytes
-        < MIN_SEGMENT_SIZE.saturating_mul(active_ranges as u64 + 1)
-    {
-        return Some("too little data remains");
-    }
-    None
-}
-
 fn allow_low_throughput_route_switch(
     has_alternate_route: bool,
     retry_with_single_thread: bool,
@@ -3051,10 +2855,6 @@ fn native_first_byte_timeout(
     } else {
         FILE_TRANSFER_FIRST_BYTE_TIMEOUT
     }
-}
-
-fn should_use_segmented_download(size: u64, resumable_part_bytes: u64) -> bool {
-    size >= SEGMENTED_DOWNLOAD_THRESHOLD && resumable_part_bytes < size / 2
 }
 
 fn probe_is_meaningfully_faster(
@@ -4797,7 +4597,8 @@ async fn download_to_path_inner(
     }
     let mut attempts = 0;
     let mut last_error = None;
-    let mut attempt_history = VecDeque::new();
+    let mut attempt_history =
+        crate::util::download::diagnostics::DownloadAttemptHistory::new();
     let mut fallback_count = 0;
     let mut partial_route_index = None;
     let mut terminal_routes = HashSet::new();

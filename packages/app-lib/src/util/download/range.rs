@@ -1,6 +1,103 @@
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
+
+pub(crate) const SEGMENTED_DOWNLOAD_THRESHOLD: u64 = 4 * 1024 * 1024;
+pub(crate) const MIN_SEGMENT_SIZE: u64 = 256 * 1024;
+pub(crate) const INITIAL_SEGMENT_CONCURRENCY: usize = 4;
+pub(crate) const SEGMENT_EXPANSION_SAMPLE_COUNT: usize = 3;
+pub(crate) const SEGMENT_EXPANSION_INTERVAL: Duration =
+	Duration::from_millis(1500);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ParsedContentRange {
+	pub(crate) start: u64,
+	pub(crate) end: u64,
+	pub(crate) total: Option<u64>,
+}
+
+pub(crate) fn parse_content_range(
+	response: &reqwest::Response,
+) -> Option<ParsedContentRange> {
+	let value = response
+		.headers()
+		.get(reqwest::header::CONTENT_RANGE)?
+		.to_str()
+		.ok()?
+		.strip_prefix("bytes ")?;
+	let (range, total) = value.split_once('/')?;
+	let (start, end) = range.split_once('-')?;
+	Some(ParsedContentRange {
+		start: start.parse().ok()?,
+		end: end.parse().ok()?,
+		total: if total == "*" {
+			None
+		} else {
+			Some(total.parse().ok()?)
+		},
+	})
+}
+
+pub(crate) fn initial_segment_count(
+	size: u64,
+	available_permits: usize,
+) -> usize {
+	let size_limit = usize::try_from(size / MIN_SEGMENT_SIZE)
+		.unwrap_or(usize::MAX)
+		.max(1);
+	INITIAL_SEGMENT_CONCURRENCY
+		.min(available_permits.min(4))
+		.min(size_limit)
+}
+
+pub(crate) fn create_initial_ranges(size: u64, count: usize) -> Vec<DownloadRange> {
+	let base_size = size / count as u64;
+	let remainder = size % count as u64;
+	let mut start = 0_u64;
+	(0..count)
+		.map(|index| {
+			let range_size = base_size + u64::from(index < remainder as usize);
+			let end = start + range_size - 1;
+			let range = DownloadRange::new(index, start, end);
+			start = end + 1;
+			range
+		})
+		.collect()
+}
+
+pub(crate) fn expansion_block_reason(
+	snapshot: crate::util::download_manager::SpeedSnapshot,
+	active_ranges: usize,
+	concurrency_cap: usize,
+	available_permits: usize,
+	remaining_bytes: u64,
+	elapsed_since_expansion: Duration,
+) -> Option<&'static str> {
+	if active_ranges >= concurrency_cap {
+		return Some("effective concurrency cap reached");
+	}
+	if available_permits == 0 {
+		return Some("no global permit available");
+	}
+	if elapsed_since_expansion < SEGMENT_EXPANSION_INTERVAL {
+		return Some("expansion cooldown active");
+	}
+	if snapshot.sample_count < SEGMENT_EXPANSION_SAMPLE_COUNT {
+		return Some("insufficient aggregate speed samples");
+	}
+	if remaining_bytes < MIN_SEGMENT_SIZE.saturating_mul(active_ranges as u64 + 1) {
+		return Some("too little data remains");
+	}
+	None
+}
+
+pub(crate) fn should_use_segmented_download(
+	size: u64,
+	resumable_part_bytes: u64,
+) -> bool {
+	size >= SEGMENTED_DOWNLOAD_THRESHOLD && resumable_part_bytes < size / 2
+}
 
 #[derive(Clone)]
 pub(crate) struct DownloadRange {
