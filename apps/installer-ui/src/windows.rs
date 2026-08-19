@@ -582,7 +582,24 @@ fn wide_null(value: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
 }
 
 fn windows_error(error: windows::core::Error) -> std::io::Error {
-    std::io::Error::other(error)
+    use windows::Win32::Foundation::FACILITY_WIN32;
+    use windows::core::HRESULT;
+
+    let hr: HRESULT = error.code();
+    let raw = hr.0;
+
+    // If this is a Win32 error (FACILITY_WIN32), extract the underlying Win32 error code
+    let facility = (raw >> 16) & 0x1fff;
+    if facility == FACILITY_WIN32.0 as i32 {
+        let win32_code = (raw & 0xFFFF) as i32;
+        std::io::Error::from_raw_os_error(win32_code)
+    } else if let Ok(code) = i32::try_from(raw) {
+        // Fall back to using the HRESULT value as a raw OS error code when representable
+        std::io::Error::from_raw_os_error(code)
+    } else {
+        // As a last resort, preserve the original error object
+        std::io::Error::other(error)
+    }
 }
 
 fn nsis_value_option(name: &str, value: &str) -> String {
